@@ -573,6 +573,9 @@ def main():
         else:
             code = run_mmap(shellcode)
 
+    # Convert unsigned 32-bit exit code to signed for os._exit()
+    if code > 0x7FFFFFFF:
+        code = code - 0x100000000
     _log('ok', "Exit code: %d" % code)
     os._exit(code)
 
