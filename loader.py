@@ -173,6 +173,21 @@ def _detect_arch():
     return machine, 64
 
 
+def _detect_process_arch():
+    """Detect the architecture of the current Python process on Windows.
+
+    platform.machine() returns the physical CPU arch, but when Python is
+    running under emulation (e.g. x86_64 on ARM64) the child processes
+    it spawns will match the emulated arch, not the CPU.
+    PROCESSOR_ARCHITECTURE reflects the process's own arch.
+    """
+    proc_arch = os.environ.get('PROCESSOR_ARCHITECTURE', '').lower()
+    for aliases, family, bits in _MACHINE_ALIASES:
+        if proc_arch in aliases:
+            return family, bits
+    return _detect_arch()
+
+
 def get_host():
     """Returns (os_name, family, bits) for the current host."""
     family, bits = _detect_arch()
@@ -516,14 +531,23 @@ def main():
     host_os, host_family, host_bits = get_host()
     python_bits = struct.calcsize("P") * 8
 
-    # run_mmap executes shellcode in-process, so it must match the Python
-    # interpreter's bitness --not the CPU's.  run_injected (Windows) spawns
-    # a native-arch process, so it can use the true OS bitness.
-    exec_bits = python_bits if host_os != 'windows' else host_bits
+    # On Windows, the Python process may be emulated (e.g. x86_64 on ARM64).
+    # Child processes inherit the emulated arch, not the CPU arch, and
+    # cross-arch CreateRemoteThread is not supported.  Use the process arch
+    # for both artifact selection and injection.
+    if host_os == 'windows':
+        process_family, process_bits = _detect_process_arch()
+        exec_bits = process_bits
+    else:
+        process_family, process_bits = host_family, host_bits
+        # run_mmap executes in-process, so must match Python's bitness.
+        exec_bits = python_bits
 
     _log('inf', "Host: %s/%s/%dbit" % (host_os, host_family, host_bits))
     _log('inf', "Python: %s (%dbit)" % (platform.python_version(), python_bits))
     _log('dbg', "sys.platform: %s  machine: %s" % (sys.platform, platform.machine()))
+    if process_family != host_family:
+        _log('inf', "Emulated: process is %s/%dbit on %s/%dbit CPU" % (process_family, process_bits, host_family, host_bits))
     _log('dbg', "Exec bits: %d  (method: %s)" % (exec_bits, "inject" if host_os == 'windows' else "mmap"))
 
     if shellcode_path:
@@ -541,7 +565,7 @@ def main():
         _log('dbg', "Header: %s" % _hexdump(shellcode))
 
         if host_os == 'windows':
-            cross_family = host_family != target['family']
+            cross_family = process_family != target['family']
             code = run_injected(shellcode, arch, cross_family=cross_family)
         elif target['family'] != host_family or target['bits'] != exec_bits:
             _log('err', "Arch mismatch: cannot run %s shellcode in %dbit Python on %s/%dbit"
@@ -551,10 +575,11 @@ def main():
             code = run_mmap(shellcode)
     else:
         # --- Remote mode: download from GitHub ---
-        key = (host_os, host_family, exec_bits)
+        # On Windows use process arch (may differ from CPU under emulation).
+        key = (host_os, process_family, exec_bits)
         if key not in _ARTIFACT_MAP:
             _log('err', "Unsupported host: %s/%s/%dbit (Python %dbit)"
-                 % (host_os, host_family, host_bits, python_bits))
+                 % (host_os, process_family, exec_bits, python_bits))
             sys.exit(1)
 
         plat, remote_arch = _ARTIFACT_MAP[key]
@@ -568,7 +593,7 @@ def main():
 
         if host_os == 'windows':
             target = ARCH[remote_arch]
-            cross_family = host_family != target['family']
+            cross_family = process_family != target['family']
             code = run_injected(shellcode, remote_arch, cross_family=cross_family)
         else:
             code = run_mmap(shellcode)
